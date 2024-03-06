@@ -98,7 +98,7 @@ data:
   multi_modal: true
 
   num_threads: 2
-  idx_dir: /data/chrisc/olmo-text-seq-index/
+  idx_dir: /net/nfs/prior/chrisc/olmo-text-seq-index
   paths:
     - r2://olmo-data/preprocessed/olmo-mix/v1_5/gpt-neox-20b-pii-special/part-000-00000.npy
     - r2://olmo-data/preprocessed/olmo-mix/v1_5/gpt-neox-20b-pii-special/part-000-00001.npy
