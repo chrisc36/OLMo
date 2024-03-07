@@ -8,7 +8,7 @@ def main():
     aws_dir = expanduser("~/.aws")
     print(f"Setting up AWS at {aws_dir}")
     mkdir(aws_dir)
-    with open(join(aws_dir, "credentials"), "wb") as f:
+    with open(join(aws_dir, "credentials"), "w") as f:
         f.write(environ["R2_CREDENTIALS"])
     print("Starting torchrun")
     run(["torchrun"] + list(sys.argv[1:]))
