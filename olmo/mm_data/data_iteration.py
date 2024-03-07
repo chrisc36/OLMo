@@ -652,7 +652,8 @@ def build_iteration_order(
     logger.info(f"Packing efficiency={tokens_per_seq/seq_len:0.3f}, {tokens_per_seq:0.1f} tokens and {ex_per_seq:0.1f} "
                 f"examples per a sequence on average.")
     if len(idx) != stats.n_docs:
-        logger.info(f"Embedded {hs(len(idx))} docs ({len(idx)/stats.n_docs:0.2f} increase due to splitting)")
+        logger.info(f"Embedded {hs(len(idx))} docs ({len(idx)/stats.n_docs:0.2f} increase due to splitting), "
+                    f"average length {stats.n_tokens/len(idx):0.1f} ")
 
     if data.shuffle_sequences:
         logger.info(f"Shuffling sequences...")
