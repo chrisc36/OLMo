@@ -1,0 +1,21 @@
+version: v2
+budget: ai2/oe-training
+description: run
+tasks:
+  # We only have one step in our experiment, so there's only one entry in this list
+  - name: training
+    image:
+      beaker: petew/olmo-torch2-gantry
+    command: [cd /code; /opt/miniconda3/bin/torchrun --nproc_per_node=1 scripts/train.py configs/mm-tiny.yaml --global_train_batch_size=4 --device_train_microbatch_size=4 --data.num_workers=2 --data.num_threads=2 --data.paths="[/net/nfs/prior/chrisc/olmo/data_files/laion2b-1m-sample.bin]" --data.idx_dir=/net/nfs/prior/chrisc/olmo/datasets/liaon2b-1m-sample --data.object_store_config.source_folder=/net/nfs/prior/chrisc/olmo/image_stor --console_log_interval=10 --stop_at=200 --console_log_interval=10]
+    result:
+      # Beaker will capture anything that's written to this location and store it in the results
+      # dataset. This location is required to be a directory, not a file.
+      path: /output
+    resources:
+      gpuCount: 1
+    context:
+      priority: normal
+    datasets:
+    - mountPath: /code
+      source:
+        beaker: olmo/code

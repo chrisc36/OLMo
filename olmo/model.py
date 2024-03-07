@@ -29,6 +29,7 @@ import torch
 import torch.backends.cuda
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL.Image import Image
 from torch import einsum
 
 from .aliases import PathOrStr
@@ -41,9 +42,11 @@ from .config import (
     FSDPWrapStrategy,
     LayerNormType,
     ModelConfig,
+    VisionBackboneType,
 )
 from .exceptions import OlmoConfigurationError
 from .initialization import ModuleType, init_weights
+from .mm_data.image_preprocessing import ResizeImage
 from .torch_util import ensure_finite_
 
 if sys.version_info.minor > 8:
@@ -934,6 +937,11 @@ class OlmoOutput(NamedTuple):
     Attention keys and values from each block.
     """
 
+    hidden_states: Optional[Tuple[torch.Tensor]]
+    """
+    Hidden states from each block.
+    """
+
 
 class OlmoGenerateOutput(NamedTuple):
     token_ids: torch.LongTensor
@@ -1004,6 +1012,55 @@ class OlmoBlockGroup(nn.ModuleList):
             block.set_activation_checkpointing(strategy)
 
 
+class OlmoVisionBackbone(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+
+    @classmethod
+    def build(cls, config: ModelConfig) -> OlmoVisionBackbone:
+        v_cfg = config.vision_backbone
+        assert v_cfg is not None
+        if v_cfg.name == VisionBackboneType.linear:
+            return OlmoLinearVisionBackbone(config)
+        else:
+            raise NotImplementedError(v_cfg.name)
+
+    def get_image_preprocessor(self):
+        raise NotImplementedError()
+
+    def reset_parameters(self):
+        pass
+
+
+class OlmoLinearVisionBackbone(OlmoVisionBackbone):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        v_cfg = self.config.vision_backbone
+        self.preprocessor = ResizeImage(
+            (v_cfg.image_width, v_cfg.image_height),
+            (v_cfg.patch_width, v_cfg.patch_height),
+            v_cfg.resize_method
+        )
+        assert v_cfg is not None
+        self.ff = nn.Linear(
+            v_cfg.patch_width * v_cfg.patch_height * 3, self.config.d_model, device=self.config.init_device
+        )
+        if v_cfg.frozen:
+            for param in self.ff.parameters():
+                param.requires_grad = False
+
+    def forward(self, image_patches: torch.Tensor) -> torch.Tensor:
+        batch_size, num_patches, *_ = image_patches.shape
+        # Reshape image patches from (batch_size, num_patches, patch_width, patch_height, 3)
+        # to (batch_size, num_patches, patch_width * patch_height * 3)
+        image_patches = image_patches.view(batch_size, num_patches, -1)
+        return self.ff(image_patches)
+
+    def get_image_preprocessor(self):
+        return self.preprocessor
+
+
 class Olmo(nn.Module):
     def __init__(self, config: ModelConfig, init_params: bool = True):
         super().__init__()
@@ -1063,6 +1120,7 @@ class Olmo(nn.Module):
             self.transformer.update(
                 {"wpe": nn.Embedding(config.max_sequence_length, config.d_model, device=config.init_device)}
             )
+
         if not config.weight_tying:
             self.transformer.update(
                 {
@@ -1074,6 +1132,11 @@ class Olmo(nn.Module):
                     )
                 }
             )
+
+        self.vision_backbone: Optional[OlmoVisionBackbone] = None
+        if config.vision_backbone is not None:
+            self.vision_backbone = OlmoVisionBackbone.build(config)
+
         # When `init_device="meta"` FSDP will call `reset_parameters()` to initialize weights.
         if init_params and self.config.init_device != "meta":
             self.reset_parameters()
@@ -1120,6 +1183,10 @@ class Olmo(nn.Module):
         if hasattr(self.transformer, "ff_out"):
             init_weights(self.config, self.transformer.ff_out, type_of_module=ModuleType.final_out)  # type: ignore
 
+        # Vision backbone.
+        if self.vision_backbone is not None:
+            self.vision_backbone.reset_parameters()
+
         # Let the blocks handle themselves.
         if self.config.block_group_size == 1:
             for block in self.transformer.blocks:
@@ -1148,8 +1215,11 @@ class Olmo(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
         past_key_values: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        image_patches: Optional[torch.Tensor] = None,
+        image_offsets: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         last_logits_only: bool = False,
+        output_hidden_states: Optional[bool] = None,
     ) -> OlmoOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1177,10 +1247,16 @@ class Olmo(nn.Module):
         :param past_key_values: Pre-computed keys and values for each attention block.
             Can be used to speed up sequential decoding. The `input_ids` which have
             their past given to this model should not be passed as `input_ids` as they have already been computed.
+        :param image_patches: For multi-modal models, image patch inputs of shape
+            `(num_patches, patch_width, patch_height, 3)`.
+        :param image_offsets: For mulit-modal models, specifies where in the input IDs the embedded image
+            patches should go. Shape `(num_patches,)`.
         :param use_cache: If `True`, return key and value tensors for each block.
         :param last_logits_only: If `True`, only compute the logits for the last token of each sequence.
             This can speed up decoding when you only care about the next token.
         """
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else False
+
         if past_key_values:
             assert len(past_key_values) == self.config.n_layers
 
@@ -1190,9 +1266,26 @@ class Olmo(nn.Module):
         else:
             past_length = past_key_values[0][0].size(-2)
 
+        img_emb: Optional[torch.Tensor] = None
+        if image_patches is not None:
+            # Get image patch embeddings.
+            assert self.vision_backbone is not None
+            assert image_offsets is not None
+            # shape: (batch_size, num_patches, d_model)
+            img_emb = self.vision_backbone(image_patches)
+
         # Get embeddings of input.
         # shape: (batch_size, seq_len, d_model)
         x = self.transformer.wte(input_ids) if input_embeddings is None else input_embeddings  # type: ignore
+
+        if img_emb is not None:
+            # Inject image patch embeddings into input embeddings.
+            assert image_offsets is not None
+            image_offsets_mask = image_offsets >= 0
+            batch_idx = torch.arange(0, batch_size, device=x.device).repeat_interleave(
+                image_offsets_mask.sum(dim=-1)
+            )
+            x.index_put_((batch_idx, image_offsets[image_offsets_mask]), img_emb[image_offsets_mask])
 
         if not (self.config.alibi or self.config.rope):
             # Get positional embeddings.
@@ -1250,9 +1343,16 @@ class Olmo(nn.Module):
 
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
 
+        # decoder layers
+        all_hidden_states = []
+
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
             for block_idx, block in enumerate(self.transformer.blocks):
+                if output_hidden_states:
+                    # add hidden states
+                    all_hidden_states.append(x)
+
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
                 if (
                     (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
@@ -1281,6 +1381,10 @@ class Olmo(nn.Module):
                     attn_key_values.append(cache)
         else:
             for group_idx, block_group in enumerate(self.transformer.block_groups):
+                if output_hidden_states:
+                    # add hidden states
+                    all_hidden_states.append(x)
+
                 layers_past = (
                     None
                     if past_key_values is None
@@ -1302,6 +1406,9 @@ class Olmo(nn.Module):
         # Apply final layer norm.
         # shape: (batch_size, seq_len or 1, d_model)
         x = self.transformer.ln_f(x)  # type: ignore
+        if output_hidden_states:
+            # add final hidden state post-final-layernorm, following HuggingFace's convention
+            all_hidden_states.append(x)
 
         # Get logits.
         # shape: (batch_size, seq_len or 1, vocab_size)
@@ -1312,30 +1419,42 @@ class Olmo(nn.Module):
         if self.config.scale_logits:
             logits.mul_(1 / math.sqrt(self.config.d_model))
 
-        return OlmoOutput(logits=logits, attn_key_values=attn_key_values)  # type: ignore[arg-type]
+        return OlmoOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
 
     def get_fsdp_wrap_policy(self, wrap_strategy: Optional[FSDPWrapStrategy] = None):
         if wrap_strategy is None:
             return None
+
+        # The 'recurse' mode for the wrap function does not behave like you'd expect.
+        # Even if we return False, it may still recurse because PyTorch does what it wants,
+        # not what you want. This causes issues when, for example, we want to wrap 'ff_out' (a linear layer)
+        # but not other linear layers within a block.
+        # So we have to explicitly tell PyTorch which linear layers to wrap, and we also just
+        # return True in 'recurse' mode for simplicity.
+        size_based_module_to_wrap = {self.transformer.wte}
+        if hasattr(self.transformer, "ff_out"):
+            size_based_module_to_wrap.add(self.transformer.ff_out)
+
         if wrap_strategy == FSDPWrapStrategy.by_block:
 
             def fsdp_wrap_fn(module, recurse: bool = True, nonwrapped_numel: int = 0):
                 del nonwrapped_numel
+                wrap = isinstance(module, (OlmoBlock, OlmoVisionBackbone))
                 if recurse:
-                    return True  # always recurse for simplicity
-                return isinstance(module, OlmoBlock)
+                    return True
+                else:
+                    return wrap
 
             return fsdp_wrap_fn
         elif wrap_strategy == FSDPWrapStrategy.by_block_and_size:
 
             def fsdp_wrap_fn(module, recurse: bool = True, nonwrapped_numel: int = 0):
                 del nonwrapped_numel
+                wrap = isinstance(module, (OlmoBlock, OlmoVisionBackbone)) or module in size_based_module_to_wrap
                 if recurse:
-                    # Determine if we should recurse.
-                    return not isinstance(module, OlmoBlock)
+                    return True
                 else:
-                    # Determine if we should wrap.
-                    return isinstance(module, (OlmoBlock, nn.Linear, nn.Embedding))
+                    return wrap
 
             return fsdp_wrap_fn
         elif wrap_strategy == FSDPWrapStrategy.by_block_group:
@@ -1346,9 +1465,11 @@ class Olmo(nn.Module):
 
             def fsdp_wrap_fn(module, recurse: bool = True, nonwrapped_numel: int = 0):
                 del nonwrapped_numel
+                wrap = isinstance(module, (OlmoBlockGroup, OlmoVisionBackbone))
                 if recurse:
-                    return True  # always recurse for simplicity
-                return isinstance(module, OlmoBlockGroup)
+                    return True
+                else:
+                    return wrap
 
             return fsdp_wrap_fn
         elif wrap_strategy == FSDPWrapStrategy.by_block_group_and_size:
@@ -1359,18 +1480,19 @@ class Olmo(nn.Module):
 
             def fsdp_wrap_fn(module, recurse: bool = True, nonwrapped_numel: int = 0):
                 del nonwrapped_numel
+                wrap = (
+                    isinstance(module, (OlmoBlockGroup, OlmoVisionBackbone)) or module in size_based_module_to_wrap
+                )
                 if recurse:
-                    # Determine if we should recurse.
-                    return not isinstance(module, OlmoBlockGroup)
+                    return True
                 else:
-                    # Determine if we should wrap.
-                    return isinstance(module, (OlmoBlockGroup, nn.Linear, nn.Embedding))
+                    return wrap
 
             return fsdp_wrap_fn
         elif wrap_strategy == FSDPWrapStrategy.size_based:
             from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
-            return size_based_auto_wrap_policy
+            return partial(size_based_auto_wrap_policy, force_leaf_modules={OlmoVisionBackbone})
         elif wrap_strategy in {
             FSDPWrapStrategy.one_in_two,
             FSDPWrapStrategy.one_in_three,
@@ -1386,9 +1508,11 @@ class Olmo(nn.Module):
 
             def fsdp_wrap_fn(module, recurse: bool = True, nonwrapped_numel: int = 0):
                 del nonwrapped_numel
+                wrap = isinstance(module, (OlmoBlock, OlmoVisionBackbone)) and module.layer_id % c == 0
                 if recurse:
-                    return True  # always recurse for simplicity
-                return isinstance(module, OlmoBlock) and module.layer_id % c == 0
+                    return True
+                else:
+                    return wrap
 
             return fsdp_wrap_fn
         else:

@@ -536,6 +536,8 @@ class Trainer:
             input_ids=batch["input_ids"],
             attention_mask=batch.get("attention_mask"),
             attention_bias=batch.get("attention_bias"),
+            image_patches=batch.get("image_patches"),
+            image_offsets=batch.get("image_offsets"),
         ).logits
         logits_for_loss = logits[..., :-1, :].contiguous()
         # shape: (batch_size * seq_len, vocab_size)
@@ -877,7 +879,7 @@ class Trainer:
         if self.cfg.torch_profiling and get_global_rank() == 0:
             from torch.profiler import schedule
 
-            profiling_schedule = schedule(wait=1, warmup=5, active=3)
+            profiling_schedule = schedule(wait=1, warmup=5, active=3, repeat=1)
 
             def on_trace_ready(p):
                 profiler_output_dir = Path(self.cfg.save_folder) / "profiler"
