@@ -11,7 +11,7 @@ def main():
     with open(join(aws_dir, "credentials"), "w") as f:
         f.write(environ["R2_CREDENTIALS"])
     print("Starting torchrun")
-    run(["torchrun"] + list(sys.argv[1:]))
+    run(list(sys.argv[1:]))
 
 
 if __name__ == '__main__':
