@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import cProfile
 import gc
+import json
 import logging
 import math
 import os
+import pickle
 import random
 import shutil
 import time
@@ -19,6 +21,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import wandb
+from datasets import tqdm
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader
 
@@ -47,7 +51,7 @@ from .torch_util import (
     move_to_device,
     peak_gpu_memory,
     synchronize_flag,
-    synchronize_value,
+    synchronize_value, get_local_rank,
 )
 from .util import upload
 
@@ -638,17 +642,160 @@ class Trainer:
                 z_loss = z_loss.view(batch["input_ids"].shape[0], -1)
         return ce_loss, z_loss, logits
 
+    def find_high_grad_batch(self):
+        top_batches = []
+        step = 0
+
+        for batch_ix, batch in enumerate(self.train_loader):
+            if batch_ix % 1000 == 0:
+                save_file = f"shard{get_local_rank()}-step{batch_ix}_largest_norm.pkl"
+            batch = move_to_device(batch, self.device)
+
+            # Split into micro-batches.
+            micro_batches = self.split_batch(batch)
+            instance_mask = batch["instance_mask"]
+
+            micro_batches = micro_batches[211:212]
+            instance_mask = instance_mask[211:212]
+
+            # micro_batches = micro_batches[1]
+
+            # for i in range(10):
+            #     micro_batches.append(
+            #         dict(input_ids=input_ids[:, 2230+i:]))
+            # micro_batches = [dict(input_ids=input_ids[:, 2230:])]
+            # micro_batches[0] = dict(
+            #     dict(input_ids=torch.concat([
+            #         micro_batches[0]["input_ids"][:, 2230:],
+            #         input_ids[:, 2230:]
+            #     ], 0))
+            # )
+
+            # if self.cfg.debug:
+            #     os.makedirs(self.cfg.debug, exist_ok=True)
+            # tmp = micro_batches[0]
+            # with open("batches.pkl", "wb") as f:
+            #     pickle.dump({k: v.detach().cpu() for k, v in tmp.items()}, f)
+            #
+            # ids = tmp["input_ids"]
+            # micro_batches = []
+            # for i in range(0, 4097):
+            #     micro_batches.append(dict(input_ids=ids[:, i:]))
+
+            # In case this helps with memory utilization.
+            del batch
+
+            ce_batch_loss = torch.tensor(0.0, device=self.device)
+            z_batch_loss = None if not self.cfg.softmax_auxiliary_loss else torch.tensor(0.0, device=self.device)
+
+            from .model import DEBUG_STATS
+            largest_norm = -1
+            all_stats = []
+
+            print("STARTING")
+            for micro_ix, micro_batch in enumerate(micro_batches):
+                with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
+                    # Run forward pass.
+                    ce_loss, z_loss, logits = self.model_forward(
+                        micro_batch, compute_z_loss=self.cfg.softmax_auxiliary_loss
+                    )
+
+                    # Update overall CE batch loss.
+                    ce_batch_loss += ce_loss.detach()
+
+                    # Get loss to optimize for.
+                    if self.cfg.softmax_auxiliary_loss:
+                        assert z_loss is not None
+                        assert z_batch_loss is not None
+                        z_loss = z_loss / len(micro_batches)
+                        loss = ce_loss + z_loss
+
+                        # Update overall Z batch loss.
+                        z_batch_loss += z_loss.detach()
+                    else:
+                        loss = ce_loss
+
+                # Run backward pass.
+                loss.backward()
+
+                if len(micro_batches) == 1:
+                    from olmo.tokenizer import Tokenizer
+                    tok = Tokenizer.from_train_config(self.cfg)
+                    # text = tok.decode(micro_batches[0]["input_ids"][0].detach().cpu().numpy().tolist())
+                    params = {k: v for v, k in zip(self.optim.param_groups[0]["params"], self.optim.param_groups[0]["param_names"])}
+                    norms = {k: torch.sqrt((p.grad*p.grad).sum()).item() for k, p in params.items()}
+                    grad_norm = np.sqrt(sum(x*x for x in norms.values()))
+                    import pdb; pdb.set_trace()
+                    # for k, v in tqdm(list(params.items())):
+                    #     with open(f"/data/chrisc/grads/{k}.pkl", "wb") as f:
+                    #         pickle.dump(v.grad.detach().cpu(), f)
+                    # import pdb; pdb.set_trace()
+
+                stats = self.optim.clip_grads_and_collect_metrics(step)
+
+                loss = loss.detach().cpu()
+                debug_stats = {}
+                for k, v in DEBUG_STATS.items():
+                    if isinstance(v, tuple):
+                        v = [x.detach().cpu() for x in v]
+                    else:
+                        v = v.detach().cpu()
+                    debug_stats[k] = v
+                stats = {k: v.detach().cpu() for k, v in stats.items()}
+                stats["loss"] = loss
+                micro_batch = {k: v.detach().cpu() for k, v in micro_batch.items()}
+                stats["instance_mask"] = instance_mask[micro_ix].detach().cpu()
+
+                if get_local_rank() == 0 and len(micro_batches) > 0:
+                    os.makedirs(self.cfg.debug, exist_ok=True)
+                    import pdb; pdb.set_trace()
+                    with open(f"{self.cfg.debug}/step{step}.pkl", "wb") as f:
+                        pickle.dump((debug_stats, stats, micro_batch), f)
+                    gnorm = stats["total_grad_norm"]
+                    top_batches.append((float(gnorm), float(loss), int(step)))
+                    if gnorm > largest_norm:
+                        print("*"*5 + f" step {step}: New norm {gnorm:0.4f}>{largest_norm:0.4f}" + "*"*5)
+                        largest_norm = gnorm
+                        with open(f"{self.cfg.debug}/index.json", "w") as f:
+                            json.dump(top_batches, f, indent=2)
+                    # else:
+                    #     if step % 10 == 0:
+                    #         print("*"*5 + f" step {step}: New norm {gnorm:0.4f}<{largest_norm:0.4f}" + "*"*5)
+                    print("*"*5 + f" step {step}: New norm {gnorm:0.4f} vs {largest_norm:0.4f}, mask={instance_mask[micro_ix].detach().cpu()}" + "*"*5)
+                DEBUG_STATS.clear()
+                step += 1
+                self.optim.zero_grad(set_to_none=True)
+            raise ValueError()
+
     def train_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # Split into micro-batches.
         micro_batches = self.split_batch(batch)
         batch_size_in_tokens = batch['input_ids'].numel()
+
+        # with open(f"shard{get_local_rank()}-step0_largest_norm.pkl", "rb") as f:
+        #     tmp = pickle.load(f)
+        #     gnorm, loss, micro_batch = tmp[-1]
+        #     micro_batch = move_to_device(micro_batch, self.device)
+        #     micro_batches = [micro_batch]
+
+        # with open("/data/chrisc/dbg/step1959-batch.pkl", "rb") as f:
+        #     micro_batch = pickle.load(f)
+        #     micro_batch = move_to_device(micro_batch, self.device)
+        #     micro_batches = [micro_batch]
 
         # In case this helps with memory utilization.
         del batch
 
         ce_batch_loss = torch.tensor(0.0, device=self.device)
         z_batch_loss = None if not self.cfg.softmax_auxiliary_loss else torch.tensor(0.0, device=self.device)
-        for micro_batch in micro_batches:
+
+        from .model import DEBUG_STATS
+        largest_norm = -1
+
+        for micro_ix, micro_batch in enumerate(micro_batches):
+            # if micro_ix % 16 == 0:
+            #     log.info(f"Batch {micro_ix}/{len(micro_batches)}")
+
+            DEBUG_STATS["step"] = f"step{self.global_step}m{micro_ix}"
             with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
                 # Run forward pass.
                 ce_loss, z_loss, logits = self.model_forward(
@@ -657,9 +804,6 @@ class Trainer:
                     loss_reduction="sum"
                 )
                 ce_loss = ce_loss / batch_size_in_tokens
-
-                # In case this helps with memory utilization.
-                del micro_batch
 
                 # Update overall CE batch loss.
                 ce_batch_loss += ce_loss.detach()
@@ -681,15 +825,49 @@ class Trainer:
             # Run backward pass.
             loss.backward()
 
+            # gnorm = 0
+            # for group in self.optim.param_groups:
+            #     for param in group["params"]:
+            #         if param.grad is not None:
+            #             gnorm += (param.grad * param.grad).sum()
+            # gnorm = torch.sqrt(gnorm).detach().cpu().numpy()
+            # loss = loss.detach().cpu()
+            # if (micro_ix + get_local_rank()*2) % 32 == 0:
+            #     print(f"proc {get_local_rank()}, loss={loss:0.4f} norm={gnorm:0.4f}")
+            # if gnorm > largest_norm:
+            #     largest_norm = gnorm
+            #     save_file = f"shard{get_local_rank()}_largest_norm.pkl"
+            #     print(f"proc {get_local_rank()}: Largest norm {gnorm:0.5f}>{largest_norm:0.5f} save to {save_file}")
+            #     with open(save_file, "wb") as f:
+            #         pickle.dump({k: v.detach().cpu() for k, v in micro_batch.items()}, f)
+            #
+            #
+            # import re
+            # def _order(k):
+            #     block = int(re.findall("blocks.([0-9]+)", '_fsdp_wrapped_module.transformer.blocks.0._fsdp_wrapped_module.att_proj.weight')[0])
+            #     return block, k
+            #
+            # grp = self.optim.param_groups[0]
+            # grads = {k.replace("_fsdp_wrapped_module.", ""): v for k, v in zip(grp["param_names"], grp["params"])}
+            # norms = [(k, torch.sqrt((v.grad*v.grad).sum())) for k, v in grads.items() if v.grad is not None]
+            # norms.sort(key=lambda x: -x[1])
+            # print(get_local_rank(), [x[1] for x in zip(grp["params"], grp["param_names"]) if x[0].grad is None])
+            #
+            # import pdb; pdb.set_trace()
+            # DEBUG_STATS.clear()
+            # self.optim.zero_grad(set_to_none=True)
+
         return ce_batch_loss, z_batch_loss
 
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
+        batch = move_to_device(batch, self.device)
+
         metrics: Dict[str, float] = {}
 
         # Write data-indices to file.
-        if self.indices_file is not None and "index" in batch:
-            indices = "\t".join(str(int(i)) for i in batch["index"])
-            self.indices_file.write(f"{self.global_step}\t{indices}\n")
+        # if self.indices_file is not None and "index" in batch:
+        #     indices = "\t".join(str(int(i)) for i in batch["index"])
+        #     self.indices_file.write(f"{self.global_step}\t{indices}\n")
 
         # Record how many instances are going to be skipped (masked out).
         if (instance_mask := batch.get("instance_mask")) is not None:
@@ -699,10 +877,9 @@ class Trainer:
         self.optim.zero_grad(set_to_none=True)
 
         # Move tensors to the right device.
-        batch = move_to_device(batch, self.device)
+        ce_batch_loss, z_batch_loss = self.train_batch(batch)
 
         # Run forward-backward pass.
-        ce_batch_loss, z_batch_loss = self.train_batch(batch)
 
         # Collect loss, potentially reducing over all ranks.
         if reduce_global_loss:
@@ -713,7 +890,8 @@ class Trainer:
                 z_batch_loss.div_(get_world_size())
 
         # Clip gradient norms and collect param/gradient/optim metrics.
-        should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
+        # should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
+        should_log_optim_metrics_this_step = True
         optim_metrics = self.optim.clip_grads_and_collect_metrics(
             self.global_step,
             collect_param_metrics=should_log_optim_metrics_this_step,
@@ -721,6 +899,11 @@ class Trainer:
             # HYBRID sharding.
             process_group=self.fsdp_model.process_group,
         )
+        if 'total_grad_norm' in optim_metrics:
+            grad_norm = float(optim_metrics['total_grad_norm'].detach().cpu())
+            log.info(f"Done batch, step={self.global_step} gnorm={grad_norm:0.4f}")
+        else:
+            log.info(f"Done batch, step={self.global_step}")
 
         # Adjust the learning rate.
         for group in self.optim.param_groups:
@@ -1040,6 +1223,10 @@ class Trainer:
         stop_at: Optional[int] = self.cfg.stop_at
         save_checkpoints: bool = True
 
+        if self.cfg.debug:
+            self.find_high_grad_batch()
+            raise ValueError()
+
         with torch_profiler as p:
             for epoch in range(self.epoch or 0, self.max_epochs):
                 for batch in self.train_loader:
@@ -1105,14 +1292,21 @@ class Trainer:
                             )
 
                     # Maybe save sharded checkpoint.
+                    if self.cfg.end_at and self.global_step > self.cfg.end_at:
+                        raise ValueError()
                     if save_checkpoints and (
                         cancel_initiated
                         or (
                             self.global_step % self.cfg.save_interval == 0
                             and self.cfg.save_num_checkpoints_to_keep != 0
+                        # )
+                        # or (
+                        #     metrics.get('optim/total_grad_norm', 0) > 1.0
+                        ) or (
+                            self.global_step == 536009
                         )
                     ):
-                        log.info("Saving checkpoint...")
+                        log.info(f"Saving checkpoint {metrics.get('optim/total_grad_norm')}...")
                         checkpoint_path, _ = self.save_checkpoint(CheckpointType.sharded)
                         log.info(f"Checkpoint saved to {checkpoint_path}")
 

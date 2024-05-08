@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import pickle
 import sys
 from abc import abstractmethod
 from collections import defaultdict
@@ -44,7 +45,7 @@ from .config import (
 )
 from .exceptions import OLMoConfigurationError
 from .initialization import ModuleType, init_weights
-from .torch_util import ensure_finite_
+from .torch_util import ensure_finite_, get_local_rank
 
 if sys.version_info.minor > 8:
     from collections.abc import MutableMapping
@@ -630,6 +631,9 @@ class OLMoBlock(nn.Module):
             raise NotImplementedError(f"Unknown block type: '{config.block_type}'")
 
 
+DEBUG_STATS = {}
+
+
 class OLMoSequentialBlock(OLMoBlock):
     """
     This is a typical transformer block where the output is computed as ``MLP(LN(x + Attention(LN(x))))``
@@ -683,10 +687,35 @@ class OLMoSequentialBlock(OLMoBlock):
         #                      k, v: (batch_size, seq_len, d_model // n_heads)
         #  - for group query attn q: (batch_size, seq_len, d_model)
         #                      k, v: (batch_size, seq_len, d_model // n_kv_heads)
+        if self.config.collect_norm_stats:
+            DEBUG_STATS[f"layer{self.layer_id}-input-norm"] = torch.norm(x, dim=-1).mean()
+            DEBUG_STATS[f"layer{self.layer_id}-input-max"] = x.abs().mean(dim=1).max()
+
         if self._activation_checkpoint_fn is not None:
             qkv = self.att_proj(self._activation_checkpoint_fn(self.attn_norm, x))
         else:
             qkv = self.att_proj(self.attn_norm(x))
+
+        if self.config.collect_clipping_stats:
+            with torch.no_grad():
+                q, k, v = qkv.split(self.fused_dims, dim=-1)
+                stats = dict()
+                for name, val in [("q", q), ("k", k), ("v", v)]:
+                    val = val.cpu()
+                    clip_ix = torch.where(torch.logical_or(
+                        (val < -self.config.clip_qkv),
+                        (val > self.config.clip_qkv)
+                    ))
+                    print(f"Writing {self.layer_id}")
+                    with open(f"/data/chrisc/clip-masks/clip{self.layer_id}.pkl", "wb") as f:
+                        pickle.dump(torch.logical_or(
+                            (val < -self.config.clip_qkv),
+                            (val > self.config.clip_qkv)).detach().cpu(), f)
+                    stats[f"{name}-min-ix"] = clip_ix
+                    stats[f"{name}-max-val"] = val[clip_ix[0], clip_ix[1], clip_ix[2]]
+
+                stats["x-norm"] = torch.sqrt((x*x).sum())
+                DEBUG_STATS.update({f"layer{self.layer_id}-{k}": v for k, v in stats.items()})
 
         if self.config.clip_qkv is not None:
             qkv.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
@@ -704,6 +733,12 @@ class OLMoSequentialBlock(OLMoBlock):
         # Add attention scores.
         # shape: (B, T, C)
         x = x + self.dropout(att)
+        if self.config.collect_norm_stats:
+            DEBUG_STATS[f"layer{self.layer_id}-post-att-norm"] = torch.norm(x, dim=-1).mean()
+            DEBUG_STATS[f"layer{self.layer_id}-post-att-max"] = x.abs().mean(dim=1).max()
+            DEBUG_STATS[f"layer{self.layer_id}-att-norm"] = torch.norm(att, dim=-1).mean()
+            DEBUG_STATS[f"layer{self.layer_id}-att-max"] = x.abs().mean(dim=1).max()
+
 
         # Add feed-forward projection.
         # shape: (batch_size, seq_len, d_model)
@@ -719,7 +754,16 @@ class OLMoSequentialBlock(OLMoBlock):
             x = self.act(x)
         x = self.ff_out(x)
         x = self.dropout(x)
+
+        if self.config.collect_norm_stats:
+            DEBUG_STATS[f"layer{self.layer_id}-ff-norm"] = torch.norm(x, dim=-1).mean()
+            DEBUG_STATS[f"layer{self.layer_id}-ff-max"] = x.abs().mean(dim=1).max()
+
         x = og_x + x
+
+        if self.config.collect_norm_stats:
+            DEBUG_STATS[f"layer{self.layer_id}-post-ff-norm"] = torch.norm(x, dim=-1).mean()
+            DEBUG_STATS[f"layer{self.layer_id}-post-ff-max"] = x.abs().mean(dim=1).max()
 
         return x, cache
 

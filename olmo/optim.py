@@ -458,6 +458,11 @@ class AdamW(torch.optim.AdamW, Optimizer):
         return {key: self.state[param].get(key) for key in ("exp_avg", "exp_avg_sq")}  # type: ignore
 
 
+class Sgd(torch.optim.SGD, Optimizer):
+    def get_state_for_param(self, param: nn.Parameter) -> Dict[str, Optional[torch.Tensor]]:
+        return {}
+
+
 @dataclass
 class Scheduler(metaclass=ABCMeta):
     # NOTE: these fields are not given default values because otherwise dataclasses complains
@@ -726,6 +731,8 @@ def build_optimizer(cfg: TrainConfig, model: nn.Module) -> Optimizer:
             betas=cfg.optimizer.betas,
             weight_decay=cfg.optimizer.weight_decay,
         )
+    if cfg.optimizer.name == OptimizerType.sgd:
+        return Sgd(param_groups)
     elif cfg.optimizer.name == OptimizerType.adamw:
         return AdamW(
             param_groups,

@@ -250,6 +250,9 @@ class ModelConfig(BaseConfig):
     Clip QKV to this value when set.
     """
 
+    collect_clipping_stats: bool = False
+    collect_norm_stats: bool = False
+
     n_layers: int = 12
     """
     The number of layers/blocks.
@@ -459,6 +462,7 @@ class ModelConfig(BaseConfig):
 class OptimizerType(StrEnum):
     lionw = "lionw"
     adamw = "adamw"
+    sgd = "sgd"
 
 
 @dataclass
@@ -760,6 +764,9 @@ class TrainConfig(BaseConfig):
     """
     OLMo training configuration.
     """
+
+    debug: Optional[str] = None
+    end_at: Optional[int] = None
 
     run_name: Optional[str] = None
     """
